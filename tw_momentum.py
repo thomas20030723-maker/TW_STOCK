@@ -121,8 +121,8 @@ def backtest(px, w, start, end=None):
     # t 日收盤算訊號 → t+1 日收盤成交 → t+2 起才吃到報酬（防偷看 #1）
     pos = w.shift(2).fillna(0.0)
     drift = pos.diff().fillna(pos)
-    cost = drift.clip(lower=0).sum(1) * BUY_COST + (-drift.clip(upper=0)).sum(1) * SELL_COST
-    daily = (pos * ret).sum(1) - cost
+    cost = drift.clip(lower=0).sum(axis=1) * BUY_COST + (-drift.clip(upper=0)).sum(axis=1) * SELL_COST
+    daily = (pos * ret).sum(axis=1) - cost
     sl = slice(start, end)
     return daily.loc[sl], pos.loc[sl], ret.loc[sl]
 
@@ -181,7 +181,7 @@ def metrics(daily, pos=None, ret=None):
             "盈虧比": win.mean() / -loss.mean() if len(loss) and len(win) else np.nan,
             "交易次數": len(t),
             "平均持有天數": t.days.mean() if len(t) else np.nan,
-            "暴露時間": (pos.sum(1) > 0).mean(),
+            "暴露時間": (pos.sum(axis=1) > 0).mean(),
         })
     return m
 
