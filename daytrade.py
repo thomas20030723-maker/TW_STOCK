@@ -25,6 +25,10 @@ GRID = {
 }
 TOP_N = 3            # 每天最多做 3 檔（固定）
 MAX_GAP = 0.04       # 開盤跳空 > 4% 不追（固定）
+FINMIND = "https://api.finmindtrade.com/api/v4/data"
+MIN_TURNOVER = 1e8   # 20 日平均成交值 ≥ 1 億元（當時可知的流動性，固定）
+MIN_PRICE = 10       # 股價 ≥ 10 元
+DT_TRAIN_START = "2011-01-01"   # 中小型股資料從 2010 起下載
 FEE_DISCOUNT = 1.0   # 券商手續費折扣，例如 2.8 折填 0.28
 COST = 0.001425 * FEE_DISCOUNT * 2 + 0.0015 + 0.001   # 手續費雙邊 + 當沖稅 + 滑價
 
@@ -44,6 +48,52 @@ def load_ohlcv(offline=False, cache="data"):
     return d
 
 
+def get_universe(cache="data"):
+    """全部上市櫃普通股，排除 0050 權值股（=中小型）。名單用 FinMind TaiwanStockInfo，失敗就用快取。"""
+    f = os.path.join(cache, "universe_small.csv")
+    try:
+        import requests
+        js = requests.get(FINMIND, params=dict(dataset="TaiwanStockInfo", token=os.environ.get("FINMIND_TOKEN", "")), timeout=60).json()
+        u = pd.DataFrame(js["data"])
+        u = u[u.stock_id.str.fullmatch(r"[1-9]\d{3}") & u.type.isin(["twse", "tpex"])]
+        u = u[~u.industry_category.astype(str).str.contains("ETF|受益|存託|指數")]
+        u = u[~u.stock_id.isin(tm.UNIVERSE)].drop_duplicates("stock_id")
+        u["ticker"] = u.stock_id + np.where(u.type == "twse", ".TW", ".TWO")
+        u = u[["ticker", "stock_id", "stock_name"]]
+        os.makedirs(cache, exist_ok=True)
+        u.to_csv(f, index=False)
+    except Exception as e:
+        print("股票清單下載失敗，用快取：", e)
+        u = pd.read_csv(f, dtype=str)
+    return u
+
+
+def load_small(full, offline=False, cache="data"):
+    f = os.path.join(cache, "ohlcv_small.pkl")
+    if offline:
+        return pd.read_pickle(f)
+    import yfinance as yf
+    u = get_universe(cache)
+    start = "2010-01-01" if full else (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
+    parts = {k: [] for k in ["Open", "High", "Low", "Close", "Volume"]}
+    tick = u.ticker.tolist()
+    for i in range(0, len(tick), 200):
+        raw = yf.download(tick[i:i + 200], start=start, auto_adjust=False, progress=False, threads=True)
+        for k in parts:
+            if k in raw:
+                parts[k].append(raw[k].astype("float32"))
+    d = {k: pd.concat(v, axis=1).sort_index().dropna(how="all", axis=1) for k, v in parts.items()}
+    cols = d["Close"].columns
+    d = {k: v.reindex(columns=cols) for k, v in d.items()}
+    now = datetime.now(timezone(timedelta(hours=8)))
+    if d["Close"].index[-1].date() == now.date() and (now.hour, now.minute) < (14, 30):
+        d = {k: v.iloc[:-1] for k, v in d.items()}
+    d["names"] = dict(zip(u.ticker, u.stock_name))
+    os.makedirs(cache, exist_ok=True)
+    pd.to_pickle(d, f)
+    return d
+
+
 def signals(d, vol_ratio, close_pos):
     """t 日收盤後算出的候選（隔天 t+1 交易）"""
     O, H, L, C, V = (d[k] for k in ["Open", "High", "Low", "Close", "Volume"])
@@ -51,7 +101,8 @@ def signals(d, vol_ratio, close_pos):
     cp = (C - L) / (H - L).replace(0, np.nan)
     trend = C > C.rolling(20).mean()
     up = C > C.shift(1)
-    ok = (vr >= vol_ratio) & (cp >= close_pos) & trend & up & (V > 500_000)   # 至少 500 張
+    liq = (C * V).rolling(20).mean() >= MIN_TURNOVER
+    ok = (vr >= vol_ratio) & (cp >= close_pos) & trend & up & (V > 500_000) & liq & (C >= MIN_PRICE)
     score = vr.where(ok)
     return score, vr, cp
 
@@ -94,30 +145,33 @@ def metrics(daily, trades):
 
 def main():
     offline = "--offline" in sys.argv
-    d = load_ohlcv(offline)
-    pf = "params_dt.json"
-    if os.path.exists(pf):
-        p = json.load(open(pf)); grid = None
-    else:
+    pf, rf = "params_dt.json", "dt_results.json"
+    p = json.load(open(pf)) if os.path.exists(pf) else {}
+    retune = p.get("universe") != "small" or not os.path.exists(rf)
+    d = load_small(full=retune, offline=offline)
+    if retune:
         rows = []
         for vr, cp, st in itertools.product(*GRID.values()):
-            dl, tr = backtest(d, vr, cp, st, tm.TRAIN_START, tm.TRAIN_END)
+            dl, tr = backtest(d, vr, cp, st, DT_TRAIN_START, tm.TRAIN_END)
             if len(tr) >= 100:
                 rows.append({"vol_ratio": vr, "close_pos": cp, "stop": st, **metrics(dl, tr)})
         grid = pd.DataFrame(rows).sort_values("夏普值", ascending=False)
         grid.to_csv("grid_daytrade.csv", index=False)
         b = grid.iloc[0]
-        p = dict(vol_ratio=float(b.vol_ratio), close_pos=float(b.close_pos), stop=float(b.stop))
+        p = dict(vol_ratio=float(b.vol_ratio), close_pos=float(b.close_pos), stop=float(b.stop), universe="small")
         json.dump(p, open(pf, "w"))
+        res = {}
+        for name, s0, e in [("訓練期", DT_TRAIN_START, tm.TRAIN_END), ("驗證期", tm.VALID_START, None)]:
+            res[name] = {k: float(v) for k, v in metrics(*backtest(d, p["vol_ratio"], p["close_pos"], p["stop"], s0, e)).items()}
+        res["驗證期"]["截至"] = str(d["Close"].index[-1].date())
+        json.dump(res, open(rf, "w"), ensure_ascii=False)
+    else:
+        res = json.load(open(rf))       # 每日只更新候選；回測結果沿用調參當時（避免每天下載 15 年資料）
     print("當沖參數:", p)
-
-    res = {}
-    for name, s, e in [("訓練期", tm.TRAIN_START, tm.TRAIN_END), ("驗證期", tm.VALID_START, None)]:
-        dl, tr = backtest(d, **p, start=s, end=e)
-        res[name] = metrics(dl, tr)
-        res[name]["_eq"] = (1 + dl).cumprod()
     for k in ["訓練期", "驗證期"]:
-        print(k, {a: round(b, 4) if isinstance(b, float) else b for a, b in res[k].items() if a != "_eq"})
+        print(k, res[k])
+    names = d.pop("names", {})
+    global NAME_MAP; NAME_MAP = names
 
     # ---- 明日候選 ----
     score, vr, cp = signals(d, p["vol_ratio"], p["close_pos"])
@@ -126,11 +180,46 @@ def main():
     C = d["Close"].iloc[-1]
     cands = [(t, C[t], vr.iloc[-1][t], cp.iloc[-1][t]) for t in s.index[:TOP_N]]
     watch = [(t, C[t], vr.iloc[-1][t], cp.iloc[-1][t]) for t in s.index[TOP_N:TOP_N + 5]]
-    render(p, last, cands, watch, res)
+    # ---- 今日診斷：每個條件各有幾檔通過、最接近的股票卡在哪 ----
+    O, H, L, Cc, V = (d[k].iloc[-1] for k in ["Open", "High", "Low", "Close", "Volume"])
+    ma20 = d["Close"].rolling(20).mean().iloc[-1]
+    prev = d["Close"].iloc[-2]
+    conds = pd.DataFrame({
+        f"量比≥{p['vol_ratio']}": vr.iloc[-1] >= p["vol_ratio"],
+        f"收盤位置≥{p['close_pos']:.0%}": cp.iloc[-1] >= p["close_pos"],
+        "站上20MA": Cc > ma20,
+        "收紅": Cc > prev,
+        "量≥500張": V > 500_000,
+        "成交值≥1億": (d["Close"] * d["Volume"]).rolling(20).mean().iloc[-1] >= MIN_TURNOVER,
+        "股價≥10": Cc >= MIN_PRICE,
+    })
+    conds = conds[Cc.notna()]
+    diag = {"counts": conds.sum().to_dict(), "all": int(conds.all(axis=1).sum()), "n": len(conds)}
+    near = conds.sum(axis=1).sort_values(ascending=False).head(8).index
+    diag["near"] = [(t, vr.iloc[-1][t], cp.iloc[-1][t], Cc[t] / prev[t] - 1,
+                     [c for c in conds.columns if not conds.loc[t, c]]) for t in near]
+    render(p, last, cands, watch, res, diag)
 
 
-def render(p, last, cands, watch, res):
-    nm = lambda t: f"{t.replace('.TW', '')} " + __import__("dashboard").NAMES.get(t.replace(".TW", ""), "")
+NAME_MAP = {}
+
+
+def diag_html(diag, nm):
+    if not diag:
+        return ""
+    cnt = "".join(f"<tr><td>{html.escape(k)}</td><td class=num>{v} / {diag['n']}</td></tr>" for k, v in diag["counts"].items())
+    cnt += f"<tr><td><b>全部同時符合</b></td><td class=num><b>{diag['all']}</b></td></tr>"
+    near = "".join(
+        f"<tr><td>{html.escape(nm(t))}</td><td class=num>{v:.1f}x</td><td class=num>{q:.0%}</td><td class=num>{r:+.1%}</td>"
+        f"<td>{html.escape('、'.join(f) or '全部符合')}</td></tr>" for t, v, q, r, f in diag["near"])
+    return (f"<section class=card><h2>今日診斷：為什麼選到 / 沒選到</h2><div class=wrap><table>"
+            f"<tr><th>條件</th><th class=num>通過檔數</th></tr>{cnt}</table></div>"
+            f"<h2 style='margin-top:14px'>最接近的股票</h2><div class=wrap><table>"
+            f"<tr><th>股票</th><th class=num>量比</th><th class=num>收盤位置</th><th class=num>漲跌</th><th>沒通過</th></tr>{near}</table></div></section>")
+
+
+def render(p, last, cands, watch, res, diag=None):
+    nm = lambda t: f"{t.split('.')[0]} {NAME_MAP.get(t, '')}"
     stop_txt = "不停損，收盤前出場" if p["stop"] >= 1 else f"開盤價 −{p['stop']:.1%}"
     def rows(lst):
         if not lst:
@@ -146,11 +235,11 @@ def render(p, last, cands, watch, res):
         m = res[k]
         return (f"<tr><td>{k}</td><td class=num>{m['年化報酬']:.1%}</td><td class=num>{m['最大回撤']:.1%}</td>"
                 f"<td class=num>{m['夏普值']:.2f}</td><td class=num>{m['勝率']:.0%}</td><td class=num>{m['盈虧比']:.2f}</td>"
-                f"<td class=num>{m['平均每筆']:+.2%}</td><td class=num>{m['交易次數']}</td></tr>")
+                f"<td class=num>{m['平均每筆']:+.2%}</td><td class=num>{int(m['交易次數'])}</td></tr>")
     tw = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
     th = "<tr><th>股票</th><th class=num>收盤</th><th class=num>量比</th><th class=num>收盤位置</th><th class=num>開盤不追高於</th><th class=num>停損</th></tr>"
     out = f"""<!doctype html><html lang=zh-Hant><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1"><title>隔日當沖候選</title>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>中小型當沖候選</title>
 <style>
 :root{{--bg:#f7f7f5;--card:#fff;--fg:#1d1d1b;--mut:#77756f;--line:#e4e2dc;--acc:#2f5d8a;--warn:#a05a00}}
 @media (prefers-color-scheme:dark){{:root{{--bg:#151514;--card:#1f1f1d;--fg:#ecebe6;--mut:#9a988f;--line:#33322e;--acc:#7fa9d6;--warn:#e0a050}}}}
@@ -161,18 +250,20 @@ table{{width:100%;border-collapse:collapse;font-size:14px}}th,td{{padding:7px 6p
 th{{color:var(--mut);font-weight:500;font-size:12px}}.num{{text-align:right;font-variant-numeric:tabular-nums}}.wrap{{overflow-x:auto}}
 .empty{{color:var(--mut);text-align:center}}.rule{{font-size:13px;line-height:1.8}}.warn{{color:var(--warn);font-size:13px}}a{{color:var(--acc)}}
 </style></head><body><main>
-<h1>隔日當沖候選</h1>
-<div class=sub>資料日 {last.date()}｜更新於 {tw}（台北）｜<a href="index.html">← 回波段選股</a></div>
+<h1>中小型股・隔日當沖多單</h1>
+<div class=sub>資料日 {last.date()}｜更新於 {tw}（台北）｜<a href="index.html">波段選股</a>｜<a href="short.html">籌碼空單</a></div>
 <section class=card><h2>明天做多候選</h2><div class=wrap><table>{th}{rows(cands)}</table></div>
 <div class=rule><b>操作規則</b><br>
 ① 開盤價買進；開盤跳空超過 ±{MAX_GAP:.0%} 就放棄這檔<br>
 ② 停損：{stop_txt}　③ 沒停損就在收盤前（13:25 前）賣出，不留倉<br>
 <span class=hint>* 停損價以今日收盤估算，實際以明天開盤價 ×(1−{p['stop'] if p['stop'] < 1 else 0:.1%}) 為準。資金平均分 {TOP_N} 份。</span></div></section>
 <section class=card><h2>備選（前 3 檔放棄時遞補）</h2><div class=wrap><table>{th}{rows(watch)}</table></div></section>
+{diag_html(diag, nm)}
 <section class=card><h2>回測（每筆已扣手續費、當沖稅、滑價）</h2><div class=wrap><table>
 <tr><th></th><th class=num>年化</th><th class=num>最大回撤</th><th class=num>夏普</th><th class=num>勝率</th><th class=num>盈虧比</th><th class=num>平均每筆</th><th class=num>筆數</th></tr>
 {kpi('訓練期')}{kpi('驗證期')}</table></div>
-<p class=hint>參數：量比 ≥ {p['vol_ratio']}、收盤位置 ≥ {p['close_pos']:.0%}、停損 {stop_txt}。訓練期 {tm.TRAIN_START[:4]}–{tm.TRAIN_END[:4]} 挑參數，驗證期 {tm.VALID_START[:4]} 起樣本外。</p>
+<p class=hint>參數：量比 ≥ {p['vol_ratio']}、收盤位置 ≥ {p['close_pos']:.0%}、停損 {stop_txt}。訓練期 {DT_TRAIN_START[:4]}–{tm.TRAIN_END[:4]} 挑參數，驗證期 {tm.VALID_START[:4]}–{res['驗證期'].get('截至', '')[:7]} 樣本外（回測只在重新調參時更新）。<br>
+股票池：上市櫃普通股排除 0050 成分股，且當時 20 日均成交值 ≥ 1 億、股價 ≥ 10 元。</p><p class=hint></p>
 <p class=warn>日 K 回測看不到盤中走勢，實際滑價與停損成交通常更差；驗證期「平均每筆」若接近 0 或為負，代表扣完成本後沒有優勢，不建議實單。</p></section>
 <p class=sub>僅供研究，非投資建議。當沖須先開通資格並簽署風險預告書。</p>
 </main></body></html>"""
