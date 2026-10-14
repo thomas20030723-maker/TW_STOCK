@@ -13,10 +13,12 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       - run: pip install yfinance pandas numpy
+      - name: 第一次執行先用訓練期調參
+        run: '[ -f params.json ] || python tw_momentum.py'
       - run: python dashboard.py
       - run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add docs/index.html
+          git add docs/ params.json report.csv grid_train.csv 2>/dev/null || true
           git commit -m "daily update $(date -u +%F)" || echo "no change"
           git push
