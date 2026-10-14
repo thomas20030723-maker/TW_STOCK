@@ -1,0 +1,185 @@
+"""
+隔日當沖作多候選：收盤後選股 → 隔天開盤買、收盤前賣（盤中觸停損就出）
+回測規格同 tw_momentum：訓練期調參、驗證期分開報告、3 參數 × 5 值、先列偷看未來風險。
+
+======================== 可能偷看未來的地方 & 避免方式 ========================
+1. 用當天 K 棒選當天的股票 → 訊號全部用 t-1 日（含）以前的資料，交易在 t 日。
+2. 開盤價決定要不要進場 → 只用「跳空幅度」過濾，開盤當下就能知道，不算偷看。
+3. 日 K 看不到盤中順序：同一天 high、low 都碰到時不知道先碰哪個
+   → 一律假設先碰停損（保守），不做停利。
+4. 停損用 low 判斷成交 → 假設停損價成交，但實際跳空/急殺會更差，另扣滑價 0.1%。
+5. 參數在全期挑 → 只用訓練期，驗證期跑一次不回頭改。
+6. 倖存者偏差：股票池用今天的名單 → 會高估，註明。
+7. 成本：手續費 0.1425% ×2（可設折扣）＋當沖證交稅 0.15%＋滑價 0.1%。
+==============================================================================
+"""
+import itertools, json, os, sys, html
+from datetime import datetime, timezone, timedelta
+import numpy as np, pandas as pd
+import tw_momentum as tm
+
+GRID = {
+    "vol_ratio": [1.5, 2.0, 2.5, 3.0, 4.0],      # 前一日量 / 20 日均量 下限
+    "close_pos": [0.6, 0.7, 0.8, 0.9, 0.95],     # 前一日收盤在當日高低區間的位置下限（1 = 收最高）
+    "stop":      [0.01, 0.015, 0.02, 0.03, 1.0], # 盤中停損（1.0 = 不停損，收盤出）
+}
+TOP_N = 3            # 每天最多做 3 檔（固定）
+MAX_GAP = 0.04       # 開盤跳空 > 4% 不追（固定）
+FEE_DISCOUNT = 1.0   # 券商手續費折扣，例如 2.8 折填 0.28
+COST = 0.001425 * FEE_DISCOUNT * 2 + 0.0015 + 0.001   # 手續費雙邊 + 當沖稅 + 滑價
+
+
+def load_ohlcv(offline=False, cache="data"):
+    f = os.path.join(cache, "ohlcv.pkl")
+    if offline:
+        return pd.read_pickle(f)
+    import yfinance as yf
+    raw = yf.download(tm.TICKERS, start="2003-07-01", auto_adjust=False, progress=False)
+    d = {k: raw[k].dropna(how="all") for k in ["Open", "High", "Low", "Close", "Volume"]}
+    now = datetime.now(timezone(timedelta(hours=8)))
+    if d["Close"].index[-1].date() == now.date() and (now.hour, now.minute) < (14, 30):
+        d = {k: v.iloc[:-1] for k, v in d.items()}
+    os.makedirs(cache, exist_ok=True)
+    pd.to_pickle(d, f)
+    return d
+
+
+def signals(d, vol_ratio, close_pos):
+    """t 日收盤後算出的候選（隔天 t+1 交易）"""
+    O, H, L, C, V = (d[k] for k in ["Open", "High", "Low", "Close", "Volume"])
+    vr = V / V.rolling(20).mean().shift(1)
+    cp = (C - L) / (H - L).replace(0, np.nan)
+    trend = C > C.rolling(20).mean()
+    up = C > C.shift(1)
+    ok = (vr >= vol_ratio) & (cp >= close_pos) & trend & up & (V > 500_000)   # 至少 500 張
+    score = vr.where(ok)
+    return score, vr, cp
+
+
+def backtest(d, vol_ratio, close_pos, stop, start, end=None):
+    O, L, C = d["Open"], d["Low"], d["Close"]
+    score, _, _ = signals(d, vol_ratio, close_pos)
+    score = score.shift(1)                                   # 昨天的訊號 → 今天交易（防偷看 #1）
+    gap = O / C.shift(1) - 1
+    stop_px = O * (1 - stop)
+    hit = L <= stop_px                                       # 盤中觸停損（假設先碰停損 #3）
+    r = np.where(hit, -stop, C / O - 1) - COST
+    r = pd.DataFrame(r, index=O.index, columns=O.columns)
+    score = score.where(gap.abs() <= MAX_GAP)
+    rank = score.rank(axis=1, ascending=False, method="first")
+    pick = rank <= TOP_N
+    sl = slice(start, end)
+    pick, r = pick.loc[sl], r.loc[sl]
+    trades = r.where(pick).stack().dropna()
+    # 每天資金平均分給 TOP_N 檔，不足的放現金
+    daily = (r.where(pick).fillna(0).sum(axis=1)) / TOP_N
+    return daily, trades
+
+
+def metrics(daily, trades):
+    eq = (1 + daily).cumprod()
+    yrs = len(daily) / 252
+    win, loss = trades[trades > 0], trades[trades <= 0]
+    return {
+        "年化報酬": eq.iloc[-1] ** (1 / yrs) - 1,
+        "最大回撤": (eq / eq.cummax() - 1).min(),
+        "夏普值": daily.mean() / daily.std() * np.sqrt(252) if daily.std() > 0 else np.nan,
+        "勝率": len(win) / len(trades) if len(trades) else np.nan,
+        "盈虧比": win.mean() / -loss.mean() if len(win) and len(loss) else np.nan,
+        "交易次數": len(trades),
+        "平均每筆": trades.mean() if len(trades) else np.nan,
+        "有交易天數比例": (daily != 0).mean(),
+    }
+
+
+def main():
+    offline = "--offline" in sys.argv
+    d = load_ohlcv(offline)
+    pf = "params_dt.json"
+    if os.path.exists(pf):
+        p = json.load(open(pf)); grid = None
+    else:
+        rows = []
+        for vr, cp, st in itertools.product(*GRID.values()):
+            dl, tr = backtest(d, vr, cp, st, tm.TRAIN_START, tm.TRAIN_END)
+            if len(tr) >= 100:
+                rows.append({"vol_ratio": vr, "close_pos": cp, "stop": st, **metrics(dl, tr)})
+        grid = pd.DataFrame(rows).sort_values("夏普值", ascending=False)
+        grid.to_csv("grid_daytrade.csv", index=False)
+        b = grid.iloc[0]
+        p = dict(vol_ratio=float(b.vol_ratio), close_pos=float(b.close_pos), stop=float(b.stop))
+        json.dump(p, open(pf, "w"))
+    print("當沖參數:", p)
+
+    res = {}
+    for name, s, e in [("訓練期", tm.TRAIN_START, tm.TRAIN_END), ("驗證期", tm.VALID_START, None)]:
+        dl, tr = backtest(d, **p, start=s, end=e)
+        res[name] = metrics(dl, tr)
+        res[name]["_eq"] = (1 + dl).cumprod()
+    for k in ["訓練期", "驗證期"]:
+        print(k, {a: round(b, 4) if isinstance(b, float) else b for a, b in res[k].items() if a != "_eq"})
+
+    # ---- 明日候選 ----
+    score, vr, cp = signals(d, p["vol_ratio"], p["close_pos"])
+    last = score.index[-1]
+    s = score.iloc[-1].dropna().sort_values(ascending=False)
+    C = d["Close"].iloc[-1]
+    cands = [(t, C[t], vr.iloc[-1][t], cp.iloc[-1][t]) for t in s.index[:TOP_N]]
+    watch = [(t, C[t], vr.iloc[-1][t], cp.iloc[-1][t]) for t in s.index[TOP_N:TOP_N + 5]]
+    render(p, last, cands, watch, res)
+
+
+def render(p, last, cands, watch, res):
+    nm = lambda t: f"{t.replace('.TW', '')} " + __import__("dashboard").NAMES.get(t.replace(".TW", ""), "")
+    stop_txt = "不停損，收盤前出場" if p["stop"] >= 1 else f"開盤價 −{p['stop']:.1%}"
+    def rows(lst):
+        if not lst:
+            return "<tr><td colspan=6 class=empty>明天沒有符合條件的股票，休息</td></tr>"
+        out = ""
+        for t, c, v, q in lst:
+            lim = c * (1 + MAX_GAP)
+            sp = "—" if p["stop"] >= 1 else f"{c * (1 - p['stop']):.2f}*"
+            out += (f"<tr><td>{html.escape(nm(t))}</td><td class=num>{c:.2f}</td><td class=num>{v:.1f}x</td>"
+                    f"<td class=num>{q:.0%}</td><td class=num>≤ {lim:.2f}</td><td class=num>{sp}</td></tr>")
+        return out
+    def kpi(k):
+        m = res[k]
+        return (f"<tr><td>{k}</td><td class=num>{m['年化報酬']:.1%}</td><td class=num>{m['最大回撤']:.1%}</td>"
+                f"<td class=num>{m['夏普值']:.2f}</td><td class=num>{m['勝率']:.0%}</td><td class=num>{m['盈虧比']:.2f}</td>"
+                f"<td class=num>{m['平均每筆']:+.2%}</td><td class=num>{m['交易次數']}</td></tr>")
+    tw = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+    th = "<tr><th>股票</th><th class=num>收盤</th><th class=num>量比</th><th class=num>收盤位置</th><th class=num>開盤不追高於</th><th class=num>停損</th></tr>"
+    out = f"""<!doctype html><html lang=zh-Hant><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>隔日當沖候選</title>
+<style>
+:root{{--bg:#f7f7f5;--card:#fff;--fg:#1d1d1b;--mut:#77756f;--line:#e4e2dc;--acc:#2f5d8a;--warn:#a05a00}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#151514;--card:#1f1f1d;--fg:#ecebe6;--mut:#9a988f;--line:#33322e;--acc:#7fa9d6;--warn:#e0a050}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,"PingFang TC","Noto Sans TC",sans-serif}}
+main{{max-width:760px;margin:0 auto;padding:20px 16px 48px}}h1{{font-size:22px;margin:0}}h2{{font-size:15px;margin:0 0 10px}}
+.sub,.hint{{color:var(--mut);font-size:13px}}.card{{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-top:14px}}
+table{{width:100%;border-collapse:collapse;font-size:14px}}th,td{{padding:7px 6px;border-bottom:1px solid var(--line);text-align:left}}
+th{{color:var(--mut);font-weight:500;font-size:12px}}.num{{text-align:right;font-variant-numeric:tabular-nums}}.wrap{{overflow-x:auto}}
+.empty{{color:var(--mut);text-align:center}}.rule{{font-size:13px;line-height:1.8}}.warn{{color:var(--warn);font-size:13px}}a{{color:var(--acc)}}
+</style></head><body><main>
+<h1>隔日當沖候選</h1>
+<div class=sub>資料日 {last.date()}｜更新於 {tw}（台北）｜<a href="index.html">← 回波段選股</a></div>
+<section class=card><h2>明天做多候選</h2><div class=wrap><table>{th}{rows(cands)}</table></div>
+<div class=rule><b>操作規則</b><br>
+① 開盤價買進；開盤跳空超過 ±{MAX_GAP:.0%} 就放棄這檔<br>
+② 停損：{stop_txt}　③ 沒停損就在收盤前（13:25 前）賣出，不留倉<br>
+<span class=hint>* 停損價以今日收盤估算，實際以明天開盤價 ×(1−{p['stop'] if p['stop'] < 1 else 0:.1%}) 為準。資金平均分 {TOP_N} 份。</span></div></section>
+<section class=card><h2>備選（前 3 檔放棄時遞補）</h2><div class=wrap><table>{th}{rows(watch)}</table></div></section>
+<section class=card><h2>回測（每筆已扣手續費、當沖稅、滑價）</h2><div class=wrap><table>
+<tr><th></th><th class=num>年化</th><th class=num>最大回撤</th><th class=num>夏普</th><th class=num>勝率</th><th class=num>盈虧比</th><th class=num>平均每筆</th><th class=num>筆數</th></tr>
+{kpi('訓練期')}{kpi('驗證期')}</table></div>
+<p class=hint>參數：量比 ≥ {p['vol_ratio']}、收盤位置 ≥ {p['close_pos']:.0%}、停損 {stop_txt}。訓練期 {tm.TRAIN_START[:4]}–{tm.TRAIN_END[:4]} 挑參數，驗證期 {tm.VALID_START[:4]} 起樣本外。</p>
+<p class=warn>日 K 回測看不到盤中走勢，實際滑價與停損成交通常更差；驗證期「平均每筆」若接近 0 或為負，代表扣完成本後沒有優勢，不建議實單。</p></section>
+<p class=sub>僅供研究，非投資建議。當沖須先開通資格並簽署風險預告書。</p>
+</main></body></html>"""
+    os.makedirs("docs", exist_ok=True)
+    open("docs/daytrade.html", "w", encoding="utf-8").write(out)
+    print("written docs/daytrade.html")
+
+
+if __name__ == "__main__":
+    main()
