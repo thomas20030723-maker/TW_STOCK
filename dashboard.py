@@ -171,7 +171,7 @@ th{{color:var(--mut);font-weight:500;font-size:12px}}.num{{text-align:right;font
 .lg{{font-size:12px;color:var(--mut)}}.wrap{{overflow-x:auto}}
 </style></head><body><main>
 <h1>台股動能選股</h1>
-<div class=sub>資料日 {last.date()}｜更新於 {tw}（台北）｜參數 lookback={p['lookback']} · 衛星 {p['top_k']} 檔 · 0050 核心 {p['core_w']:.0%}</div>
+<div class=sub>資料日 {last.date()}｜更新於 {tw}（台北）｜<a href="daytrade.html">當沖候選 →</a>｜參數 lookback={p['lookback']} · 衛星 {p['top_k']} 檔 · 0050 核心 {p['core_w']:.0%}</div>
 <section class=card><div class=status>
 <span class="pill {'on' if risk_on else 'off'}">大盤濾網：{'多頭 可持股' if risk_on else '空頭 空手'}</span>
 <span class=pill style="background:var(--bg)">0050 {raw_b:.2f}｜200MA 約 {trig:.2f}（{gap:+.1%}）</span></div>
