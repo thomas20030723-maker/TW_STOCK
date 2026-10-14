@@ -9,7 +9,7 @@
     python tw_momentum.py --offline  # 只用 ./data 快取
 
 ======================== 可能偷看未來的地方 & 避免方式 ========================
-1. 當天收盤算訊號、當天收盤成交 → 訊號用 t 日收盤，部位從 t+1 日收盤才建立（shift 1 天）。
+1. 當天收盤算訊號、當天收盤成交 → 訊號用 t 日收盤，t+1 日收盤才成交，t+2 起計報酬（shift 2 天）。
 2. 指標用到未來資料（如 centered rolling、全期標準化）→ 只用 rolling 往回看的視窗，不做全期 z-score。
 3. 參數在全期挑選 → 網格搜尋只用訓練期報酬；驗證期只跑一次、不回頭改參數。
 4. 驗證期第一天的指標需要訓練期資料暖機 → 允許用過去資料暖機（這是合法的「過去」），
@@ -26,7 +26,7 @@
 import argparse, itertools, os
 import numpy as np, pandas as pd
 
-TRAIN_START, TRAIN_END = "2008-01-01", "2021-12-31"   # 台股免費資料約 2000s 起，無法回到 1980
+TRAIN_START, TRAIN_END = "2005-01-01", "2021-12-31"   # 台股免費資料約 2000s 起，無法回到 1980
 VALID_START = "2022-01-01"
 BENCH = "0050.TW"
 UNIVERSE = """2330 2317 2454 2308 2382 2881 2882 2891 2303 3711 2412 2886 2884 1216 2885
@@ -53,15 +53,28 @@ BUY_COST, SELL_COST = 0.001425, 0.001425 + 0.003
 def load_prices(offline=False, cache="data"):
     os.makedirs(cache, exist_ok=True)
     f = os.path.join(cache, "close.csv")
+    fr = os.path.join(cache, "raw_close.csv")
     if offline:
         if os.path.exists(f):
             return pd.read_csv(f, index_col=0, parse_dates=True)
         raise SystemExit("找不到 data/close.csv")
     import yfinance as yf
-    df = yf.download(TICKERS + [BENCH], start="2005-01-01", auto_adjust=True, progress=False)["Close"]
-    df = df.dropna(how="all")
-    df.to_csv(f)
-    return df
+    raw = yf.download(TICKERS + [BENCH], start="2003-07-01", auto_adjust=False, progress=False)
+    out = []
+    for col, path in [("Adj Close", f), ("Close", fr)]:   # 還原價算報酬；實際收盤價顯示進出場價
+        df = raw[col].dropna(how="all").ffill(limit=5)    # 個別缺值用前值補（只用過去資料）
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone(timedelta(hours=8)))
+        if df.index[-1].date() == now.date() and (now.hour, now.minute) < (14, 30):
+            df = df.iloc[:-1]                            # 盤中執行時丟掉今天未收盤的 K 棒
+        df.to_csv(path)
+        out.append(df)
+    return out[0]
+
+
+def load_raw(cache="data"):
+    fr = os.path.join(cache, "raw_close.csv")
+    return pd.read_csv(fr, index_col=0, parse_dates=True) if os.path.exists(fr) else None
 
 
 def rsi(px, n=14):
@@ -82,7 +95,7 @@ def target_weights(px, lookback, top_k, core_w):
     stocks = px.drop(columns=[BENCH])
     mom, score, r = scores(px, lookback)
     bench = px[BENCH]
-    risk_on = bench > bench.rolling(MA_FILTER).mean()
+    risk_on = bench > bench.rolling(MA_FILTER, min_periods=150).mean()
     w = pd.DataFrame(np.nan, index=px.index, columns=px.columns)
     held = []
     for i in range(max(lookback, MA_FILTER, VOL_N), len(px), REBAL):
@@ -98,12 +111,15 @@ def target_weights(px, lookback, top_k, core_w):
         else:
             held = []
         w.iloc[i] = row
-    return w.ffill().fillna(0.0)
+    w = w.ffill().fillna(0.0)
+    w.loc[~risk_on] = 0.0   # 每日檢查：跌破 200MA 隔天就出清
+    return w
 
 
 def backtest(px, w, start, end=None):
     ret = px[w.columns].pct_change().fillna(0.0)
-    pos = w.shift(1).fillna(0.0)                      # t 日訊號 → t+1 日持有（防偷看 #1）
+    # t 日收盤算訊號 → t+1 日收盤成交 → t+2 起才吃到報酬（防偷看 #1）
+    pos = w.shift(2).fillna(0.0)
     drift = pos.diff().fillna(pos)
     cost = drift.clip(lower=0).sum(1) * BUY_COST + (-drift.clip(upper=0)).sum(1) * SELL_COST
     daily = (pos * ret).sum(1) - cost
@@ -121,6 +137,31 @@ def trades(pos, ret):
         for _, idx in grp.groupby(grp).groups.items():
             out.append(((1 + ret.loc[idx, c]).prod() - 1 - BUY_COST - SELL_COST, len(idx)))
     return pd.DataFrame(out, columns=["ret", "days"])
+
+
+def trade_log(pos, px, raw=None):
+    """逐筆交易：進場日=第一個持有日的前一天收盤，出場日=最後持有日收盤"""
+    raw = px if raw is None else raw.reindex(px.index).ffill()
+    idx = pos.index
+    out = []
+    for c in pos.columns:
+        held = (pos[c] > 0).values
+        i = 0
+        while i < len(held):
+            if held[i]:
+                j = i
+                while j + 1 < len(held) and held[j + 1]:
+                    j += 1
+                ent, ext = idx[max(i - 1, 0)], idx[j]
+                open_ = j == len(held) - 1
+                r = px[c].loc[ext] / px[c].loc[ent] - 1 - BUY_COST - (0 if open_ else SELL_COST)
+                out.append(dict(股票=c, 進場日=ent.date(), 進場價=raw[c].loc[ent],
+                                出場日=None if open_ else ext.date(), 出場價=None if open_ else raw[c].loc[ext],
+                                現價=raw[c].iloc[-1], 報酬=r, 天數=j - i + 1, 持有中=open_))
+                i = j + 1
+            else:
+                i += 1
+    return pd.DataFrame(out).sort_values("進場日", ascending=False) if out else pd.DataFrame()
 
 
 def metrics(daily, pos=None, ret=None):
@@ -192,7 +233,7 @@ def main():
 
     # ---- 4) 今日選股（用最新收盤資料，明天執行）----
     mom, score, r = scores(px, p["lookback"])
-    risk_on = px[BENCH].iloc[-1] > px[BENCH].rolling(MA_FILTER).mean().iloc[-1]
+    risk_on = px[BENCH].iloc[-1] > px[BENCH].rolling(MA_FILTER, min_periods=150).mean().iloc[-1]
     scr = pd.DataFrame({"動能": mom.iloc[-1], "風險調整動能": score.iloc[-1], "RSI14": r.iloc[-1]}).dropna()
     scr = scr[(scr.RSI14 < RSI_MAX) & (scr["動能"] > 0)].sort_values("風險調整動能", ascending=False)
     print(f"\n資料日 {px.index[-1].date()}｜大盤濾網：{'多頭' if risk_on else '空頭，建議空手'}｜0050 核心 {p['core_w']:.0%}")
